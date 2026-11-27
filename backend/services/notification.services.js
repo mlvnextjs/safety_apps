@@ -1,0 +1,747 @@
+const admin = require("../firebase/firebaseAdmin");
+const pool = require("../config/db");
+
+/* ================== ROLE RULE ================== */
+function resolveTargetRoles(creatorRole) {
+  if (creatorRole === "superadmin") return ["admin", "member"];
+  if (creatorRole === "admin") return ["member"];
+  return [];
+}
+
+/* ================== NORMALIZE SITE IDS ================== */
+function normalizeSiteIds(siteIds) {
+  if (typeof siteIds === "string") {
+    try {
+      siteIds = JSON.parse(siteIds);
+    } catch {
+      siteIds = [siteIds];
+    }
+  }
+
+  if (!Array.isArray(siteIds)) siteIds = siteIds ? [siteIds] : [];
+
+  return [...new Set(siteIds)]
+    .map((id) => Number(id))
+    .filter((id) => !isNaN(id));
+}
+
+/* ================== BUILD MESSAGE ================== */
+function buildDailyPlanMessage({ creatorRole }) {
+  const senderName =
+    creatorRole === "superadmin" ? "Head Office" : creatorRole === "admin" ? "HSES" : "Tim";
+
+  return {
+    title: "📝 Daily Plan Baru Ready!",
+    body: `📢 Hai! ${senderName} baru aja buat Daily Plan nih 📋. Yuk, lihat dan kasih rating dulu dong! ⭐`,
+  };
+}
+
+function buildBuletinMessage({ creatorRole }) {
+  return {
+    title: "📰 Buletin Baru!",
+    body:
+      creatorRole === "superadmin"
+        ? "📢 Head Office upload Buletin baru. Yuk, lihat dan kasih rating dulu ya! ⭐"
+        : "📢 HSES upload Buletin baru. Yuk, lihat dan kasih rating dulu ya! ⭐",
+  };
+}
+
+function buildLpiMessage({ senderName }) {
+  return {
+    title: "⚠️ PERHATIAN LPI ACCIDENT",
+    body: `🚨 ${senderName} mengirim LPI. Tap untuk cek detail 📍`,
+  };
+}
+
+
+/* ================== GET TARGET USERS ================== */
+async function getTargetUsers({ creatorRole, siteIds, creatorId }) {
+  const roles = resolveTargetRoles(creatorRole);
+  if (!roles.length) return [];
+
+  const result = await pool.query(
+    `
+    SELECT u.id
+    FROM users u
+    JOIN roles r ON r.id = u.role_id
+    WHERE r.role_name = ANY($1::text[])
+      AND u.site_id = ANY($2::int[])
+      AND u.deleted_at IS NULL
+      AND u.id != $3
+    `,
+    [roles, siteIds, creatorId]
+  );
+
+  return result.rows.map((r) => r.id);
+}
+
+async function getTargetUsersForLpi({ siteId, creatorId }) {
+  const result = await pool.query(
+    `
+    SELECT u.id
+    FROM users u
+    JOIN roles r ON r.id = u.role_id
+    WHERE u.deleted_at IS NULL
+      AND u.id != $2
+      AND (
+        r.role_name = 'superadmin'
+        OR (r.role_name = 'admin' AND u.site_id = $1)
+      )
+    `,
+    [siteId, creatorId]
+  );
+
+  return result.rows.map((r) => r.id);
+}
+
+function getExcelFeatureLabel(feature) {
+  const key = String(feature || "").toLowerCase();
+
+  switch (key) {
+    case "p5m":
+      return "P5M";
+    case "lpi":
+      return "LPI";
+      case "hazard":
+      return "Hazard";
+    default:
+      return key ? key.toUpperCase() : "Excel";
+  }
+}
+
+/* ================== SAVE NOTIFICATIONS ================== */
+async function saveNotifications({ userIds, title, body, data }) {
+  if (!userIds.length) return;
+
+  const values = [];
+  const params = [];
+
+  userIds.forEach((userId, index) => {
+    const base = index * 4;
+    values.push(`($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4})`);
+    params.push(userId, title, body, JSON.stringify(data));
+  });
+
+  await pool.query(
+    `
+    INSERT INTO notifications (user_id, title, body, data)
+    VALUES ${values.join(",")}
+    `,
+    params
+  );
+}
+
+/* ================== HELPERS ================== */
+function chunkArray(array, size) {
+  const result = [];
+  for (let i = 0; i < array.length; i += size) {
+    result.push(array.slice(i, i + size));
+  }
+  return result;
+}
+
+async function getFcmTokensByUserIds(userIds) {
+  const tokensRes = await pool.query(
+    `
+    SELECT DISTINCT fcm_token
+    FROM user_devices
+    WHERE user_id = ANY($1::int[])
+      AND fcm_token IS NOT NULL
+      AND fcm_token <> ''
+    `,
+    [userIds]
+  );
+
+  return (tokensRes.rows || []).map((r) => r.fcm_token).filter(Boolean);
+}
+
+async function deleteInvalidTokens(tokens) {
+  if (!tokens.length) return;
+
+  await pool.query(
+    `
+    DELETE FROM user_devices
+    WHERE fcm_token = ANY($1::text[])
+    `,
+    [tokens]
+  );
+}
+
+/* ================== SEND DAILY PLAN ================== */
+async function sendDailyPlanNotification({
+  creatorRole,
+  siteIds,
+  creatorId,
+  planId,
+}) {
+  try {
+    siteIds = normalizeSiteIds(siteIds);
+    if (!siteIds.length) return console.log("❌ No valid siteIds (daily_plan)");
+
+    const userIds = await getTargetUsers({ creatorRole, siteIds, creatorId });
+    if (!userIds.length) return console.log("❌ No target users (daily_plan)");
+
+    const message = buildDailyPlanMessage({ creatorRole});
+
+    await saveNotifications({
+      userIds,
+      title: message.title,
+      body: message.body,
+      data: { type: "daily_plan", daily_plan_id: planId },
+    });
+
+    const tokens = await getFcmTokensByUserIds(userIds);
+    if (!tokens.length) return console.log("❌ No tokens (daily_plan)");
+
+    const tokenChunks = chunkArray(tokens, 500);
+    const invalidSet = new Set();
+
+    for (const chunk of tokenChunks) {
+      const resp = await admin.messaging().sendEachForMulticast({
+        tokens: chunk,
+        notification: { title: message.title, body: message.body },
+        android: {
+          priority: "high",
+          notification: {
+            channelId: "high_importance_channel",
+            sound: "default",
+          },
+        },
+        data: { type: "daily_plan", daily_plan_id: String(planId) },
+      });
+
+      resp.responses.forEach((r, idx) => {
+        if (!r.success) {
+          const code = r.error?.code;
+          if (
+            code === "messaging/registration-token-not-registered" ||
+            code === "messaging/invalid-registration-token"
+          ) {
+            invalidSet.add(chunk[idx]);
+          }
+        }
+      });
+    }
+
+    await deleteInvalidTokens([...invalidSet]);
+  } catch (err) {
+    console.error("❌ ERROR SEND DAILY PLAN NOTIFICATION:", err);
+  }
+}
+
+/* ================== SEND BULETIN ================== */
+async function sendBuletinNotification({
+  creatorRole,
+  siteIds,
+  creatorId,
+  buletinId,
+}) {
+  try {
+    siteIds = normalizeSiteIds(siteIds);
+    if (!siteIds.length) return console.log("❌ No valid siteIds (buletin)");
+
+    const userIds = await getTargetUsers({ creatorRole, siteIds, creatorId });
+    if (!userIds.length) return console.log("❌ No target users (buletin)");
+
+    const message = buildBuletinMessage({ creatorRole });
+
+    await saveNotifications({
+      userIds,
+      title: message.title,
+      body: message.body,
+      data: { type: "buletin", buletin_id: buletinId },
+    });
+
+    const tokens = await getFcmTokensByUserIds(userIds);
+    if (!tokens.length) return console.log("❌ No tokens (buletin)");
+
+    const tokenChunks = chunkArray(tokens, 500);
+    const invalidSet = new Set();
+
+    for (const chunk of tokenChunks) {
+      const resp = await admin.messaging().sendEachForMulticast({
+        tokens: chunk,
+        notification: { title: message.title, body: message.body },
+        android: {
+          priority: "high",
+          notification: {
+            channelId: "high_importance_channel",
+            sound: "default",
+          },
+        },
+        data: { type: "buletin", buletin_id: String(buletinId) },
+      });
+
+      resp.responses.forEach((r, idx) => {
+        if (!r.success) {
+          const code = r.error?.code;
+          if (
+            code === "messaging/registration-token-not-registered" ||
+            code === "messaging/invalid-registration-token"
+          ) {
+            invalidSet.add(chunk[idx]);
+          }
+        }
+      });
+    }
+
+    await deleteInvalidTokens([...invalidSet]);
+  } catch (err) {
+    console.error("❌ ERROR SEND BULETIN NOTIFICATION:", err);
+  }
+}
+
+async function sendLpiNotification({ creatorId, siteId, senderName, lpiId }) {
+  try {
+    siteId = Number(siteId);
+    if (!siteId || Number.isNaN(siteId)) return console.log("❌ Invalid siteId (lpi)");
+    if (!lpiId) return console.log("❌ No lpiId (lpi)");
+
+    const userIdsRaw = await getTargetUsersForLpi({ siteId, creatorId });
+    const userIds = [...new Set(userIdsRaw)];
+    if (!userIds.length) return console.log("❌ No target users (lpi)");
+
+    const message = buildLpiMessage({ senderName: senderName || "User" });
+
+    await saveNotifications({
+      userIds,
+      title: message.title,
+      body: message.body,
+      data: { type: "lpi", lpi_id: lpiId, site_id: siteId },
+    });
+
+    const tokens = await getFcmTokensByUserIds(userIds);
+    if (!tokens.length) return console.log("❌ No tokens (lpi)");
+
+    const tokenChunks = chunkArray(tokens, 500);
+    const invalidSet = new Set();
+
+    for (const chunk of tokenChunks) {
+      const resp = await admin.messaging().sendEachForMulticast({
+        tokens: chunk,
+        notification: { title: message.title, body: message.body },
+        android: {
+          priority: "high",
+          ttl: 24 * 60 * 60 * 1000,
+          notification: {
+            channelId: "high_importance_channel",
+            sound: "default",
+          },
+        },
+        data: {
+          type: "lpi",
+          lpi_id: String(lpiId),
+          site_id: String(siteId),
+        },
+      });
+
+      resp.responses.forEach((r, idx) => {
+        if (!r.success) {
+          const code = r.error?.code;
+          if (
+            code === "messaging/registration-token-not-registered" ||
+            code === "messaging/invalid-registration-token"
+          ) {
+            invalidSet.add(chunk[idx]);
+          }
+        }
+      });
+    }
+
+    await deleteInvalidTokens([...invalidSet]);
+  } catch (err) {
+    console.error("❌ ERROR SEND LPI NOTIFICATION:", err);
+  }
+}
+
+/* ================== SEND ROLE CHANGED ================== */
+async function sendRoleChangedNotification({ userId, newRoleName }) {
+  try {
+    userId = Number(userId);
+    if (!userId || Number.isNaN(userId)) {
+      return console.log("❌ Invalid userId (role_changed)");
+    }
+
+    const title = "🔐 Role Diperbarui";
+    const body = `🔄 Sekarang kamu adalah ${newRoleName}. Silahkan login ulang ya. ✨`;
+
+    await saveNotifications({
+      userIds: [userId],
+      title,
+      body,
+      data: { type: "role_changed" },
+    });
+
+    const tokensRes = await pool.query(
+      `
+      SELECT DISTINCT fcm_token
+      FROM user_devices
+      WHERE user_id = $1
+        AND fcm_token IS NOT NULL
+        AND fcm_token <> ''
+      `,
+      [userId]
+    );
+
+    const tokens = (tokensRes.rows || []).map((r) => r.fcm_token).filter(Boolean);
+    if (!tokens.length) return console.log("❌ No tokens (role_changed)");
+
+    const tokenChunks = chunkArray(tokens, 500);
+    const invalidSet = new Set();
+
+    for (const chunk of tokenChunks) {
+      const resp = await admin.messaging().sendEachForMulticast({
+        tokens: chunk,
+        notification: { title, body },
+        android: {
+          priority: "high",
+          notification: {
+            channelId: "high_importance_channel",
+            sound: "default",
+          },
+        },
+        data: {
+          type: "role_changed",
+          reason: "role_changed",
+        },
+      });
+
+      resp.responses.forEach((r, idx) => {
+        if (!r.success) {
+          const code = r.error?.code;
+          if (
+            code === "messaging/registration-token-not-registered" ||
+            code === "messaging/invalid-registration-token"
+          ) {
+            invalidSet.add(chunk[idx]);
+          }
+        }
+      });
+    }
+
+    await deleteInvalidTokens([...invalidSet]);
+    console.log("✅ ROLE CHANGED notif sent to user:", userId);
+  } catch (err) {
+    console.error("❌ ERROR SEND ROLE CHANGED NOTIFICATION:", err);
+  }
+}
+
+// ================== EXCEL ACCESS REQUEST NOTIF ==================
+async function getAdminsAndSuperadminsForSite({ siteId, creatorId }) {
+  const result = await pool.query(
+    `
+    SELECT u.id
+    FROM users u
+    JOIN roles r ON r.id = u.role_id
+    WHERE u.deleted_at IS NULL
+      AND u.id != $2
+      AND (
+        r.role_name = 'superadmin'
+        OR (r.role_name = 'admin' AND u.site_id = $1)
+      )
+    `,
+    [Number(siteId), Number(creatorId)]
+  );
+
+  return result.rows.map((r) => r.id);
+}
+
+function buildExcelAccessCreatedMessage({ requesterName, feature }) {
+  const featureLabel = getExcelFeatureLabel(feature);
+
+  return {
+    title: `📄 Permintaan Akses Excel ${featureLabel}`,
+    body: `👤 ${requesterName || "Member"} meminta izin export Excel ${featureLabel}. Tap untuk review.`,
+  };
+}
+
+function buildExcelAccessDecisionMessage({
+  approved,
+  decidedByName,
+  rejectReason,
+  feature,
+}) {
+  const featureLabel = getExcelFeatureLabel(feature);
+
+  if (approved) {
+    return {
+      title: "✅ Akses Excel Disetujui",
+      body: `🎉 Permintaanmu untuk export Excel ${featureLabel} disetujui oleh ${
+        decidedByName || "Admin"
+      }.`,
+    };
+  }
+
+  return {
+    title: "❌ Akses Excel Ditolak",
+    body: `Permintaanmu untuk export Excel ${featureLabel} ditolak oleh ${
+      decidedByName || "Admin"
+    }${rejectReason ? `. Alasan: ${rejectReason}` : ""}`,
+  };
+}
+
+async function sendFcmMulticastWithCleanup({ tokens, title, body, data }) {
+  if (!tokens || !tokens.length) return;
+
+  const tokenChunks = chunkArray(tokens, 500);
+  const invalidSet = new Set();
+
+  for (const chunk of tokenChunks) {
+    const resp = await admin.messaging().sendEachForMulticast({
+      tokens: chunk,
+      notification: { title, body },
+      android: {
+        priority: "high",
+        notification: {
+          channelId: "high_importance_channel",
+          sound: "default",
+        },
+      },
+      data: Object.fromEntries(
+        Object.entries(data || {}).map(([k, v]) => [k, String(v)])
+      ),
+    });
+
+    console.log("✅ FCM sent:", {
+      title,
+      body,
+      data,
+      successCount: resp.successCount,
+      failureCount: resp.failureCount,
+    });
+
+    resp.responses.forEach((r, idx) => {
+      if (!r.success) {
+        console.log("❌ FCM send error token:", chunk[idx]);
+        console.log("❌ code:", r.error?.code);
+        console.log("❌ message:", r.error?.message);
+
+        const code = r.error?.code;
+        if (
+          code === "messaging/registration-token-not-registered" ||
+          code === "messaging/invalid-registration-token"
+        ) {
+          invalidSet.add(chunk[idx]);
+        }   
+        } else {
+        console.log("✅ FCM success token:", chunk[idx]);
+      }
+    });
+  }
+
+  await deleteInvalidTokens([...invalidSet]);
+}
+
+async function sendExcelAccessRequestCreatedNotification({
+  requesterId,
+  requesterName,
+  siteId,
+  requestId,
+  feature,
+}) {
+  try {
+    const targetIdsRaw = await getAdminsAndSuperadminsForSite({
+      siteId,
+      creatorId: requesterId,
+    });
+
+    const userIds = [...new Set(targetIdsRaw)].map(Number).filter(Boolean);
+    if (!userIds.length) return console.log("❌ No target users (excel_access_request)");
+
+    const msg = buildExcelAccessCreatedMessage({ requesterName, feature });
+
+    await saveNotifications({
+      userIds,
+      title: msg.title,
+      body: msg.body,
+      data: {
+        type: "excel_access_request",
+        excel_access_request_id: requestId,
+        site_id: siteId,
+        requester_user_id: requesterId,
+        feature,
+      },
+    });
+
+    const tokens = await getFcmTokensByUserIds(userIds);
+    if (!tokens.length) return console.log("❌ No tokens (excel_access_request)");
+
+    await sendFcmMulticastWithCleanup({
+      tokens,
+      title: msg.title,
+      body: msg.body,
+      data: {
+        type: "excel_access_request",
+        excel_access_request_id: requestId,
+        site_id: siteId,
+        requester_user_id: requesterId,
+        feature,
+        title: msg.title,
+        body: msg.body,
+      },
+    });
+  } catch (err) {
+    console.error("❌ ERROR SEND EXCEL ACCESS REQUEST NOTIFICATION:", err);
+  }
+}
+
+async function sendExcelAccessDecisionNotification({
+  requesterId,
+  siteId,
+  requestId,
+  approved,
+  decidedByName,
+  rejectReason,
+  feature,
+}) {
+  try {
+    const userIds = [Number(requesterId)].filter(Boolean);
+    if (!userIds.length) return console.log("❌ Invalid requesterId (excel_access_decision)");
+
+    const msg = buildExcelAccessDecisionMessage({
+      approved,
+      decidedByName,
+      rejectReason,
+      feature,
+    });
+
+    await saveNotifications({
+      userIds,
+      title: msg.title,
+      body: msg.body,
+      data: {
+        type: "excel_access_decision",
+        excel_access_request_id: requestId,
+        site_id: siteId,
+        approved: approved ? 1 : 0,
+        feature,
+      },
+    });
+
+    const tokens = await getFcmTokensByUserIds(userIds);
+    if (!tokens.length) return console.log("❌ No tokens (excel_access_decision)");
+
+    await sendFcmMulticastWithCleanup({
+      tokens,
+      title: msg.title,
+      body: msg.body,
+      data: {
+        type: "excel_access_decision",
+        excel_access_request_id: requestId,
+        site_id: siteId,
+        approved: approved ? 1 : 0,
+        feature,
+        title: msg.title,
+        body: msg.body,
+      },
+    });
+  } catch (err) {
+    console.error("❌ ERROR SEND EXCEL ACCESS DECISION NOTIFICATION:", err);
+  }
+}
+
+async function sendExcelAccessRevokedNotification({
+  requesterId,
+  siteId,
+  revokedByName,
+  feature,
+}) {
+  try {
+    const userIds = [Number(requesterId)].filter(Boolean);
+    if (!userIds.length) return console.log("❌ Invalid requesterId (excel_access_revoked)");
+
+    const featureLabel = getExcelFeatureLabel(feature);
+    const title = "⚠️ Akses Excel Dicabut";
+    const body = `Akses export Excel ${featureLabel} kamu telah dinonaktifkan oleh ${
+      revokedByName || "Admin"
+    }. Jika perlu, silakan ajukan ulang izin akses.`;
+
+    await saveNotifications({
+      userIds,
+      title,
+      body,
+      data: {
+        type: "excel_access_revoked",
+        site_id: siteId,
+        feature,
+      },
+    });
+
+    const tokens = await getFcmTokensByUserIds(userIds);
+    if (!tokens.length) return console.log("❌ No tokens (excel_access_revoked)");
+
+    await sendFcmMulticastWithCleanup({
+      tokens,
+      title,
+      body,
+      data: {
+        type: "excel_access_revoked",
+        site_id: siteId,
+        feature,
+        title,
+        body,
+      },
+    });
+  } catch (err) {
+    console.error("❌ ERROR SEND EXCEL ACCESS REVOKED NOTIFICATION:", err);
+  }
+}
+
+async function sendExcelAccessGrantedNotification({
+  requesterId,
+  siteId,
+  grantedByName,
+  feature,
+}) {
+  try {
+    const userIds = [Number(requesterId)].filter(Boolean);
+    if (!userIds.length) return console.log("❌ Invalid requesterId (excel_access_granted)");
+
+    const featureLabel = getExcelFeatureLabel(feature);
+    const title = "✅ Akses Excel Diaktifkan";
+    const body = `Akses export Excel ${featureLabel} kamu telah diaktifkan oleh ${
+      grantedByName || "Admin"
+    }. Sekarang kamu bisa export Excel ${featureLabel} kembali.`;
+
+    await saveNotifications({
+      userIds,
+      title,
+      body,
+      data: {
+        type: "excel_access_granted",
+        site_id: siteId,
+        feature,
+      },
+    });
+
+    const tokens = await getFcmTokensByUserIds(userIds);
+    if (!tokens.length) return console.log("❌ No tokens (excel_access_granted)");
+
+    await sendFcmMulticastWithCleanup({
+      tokens,
+      title,
+      body,
+      data: {
+        type: "excel_access_granted",
+        site_id: siteId,
+        feature,
+        title,
+        body,
+      },
+    });
+  } catch (err) {
+    console.error("❌ ERROR SEND EXCEL ACCESS GRANTED NOTIFICATION:", err);
+  }
+}
+
+module.exports = {
+  sendDailyPlanNotification,
+  sendBuletinNotification,
+  sendLpiNotification,
+  sendRoleChangedNotification,
+  sendExcelAccessRequestCreatedNotification,
+  sendExcelAccessDecisionNotification,
+  sendExcelAccessRevokedNotification,
+  sendExcelAccessGrantedNotification,
+  getTargetUsers,
+};
