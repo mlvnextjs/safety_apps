@@ -639,7 +639,7 @@ class _AuditLogPageState extends State<AuditLogPage> {
       DataColumn2(label: Center(child: Text("Role")), fixedWidth: 180),
       DataColumn2(label: Center(child: Text("Site")), fixedWidth: 200),
       DataColumn2(label: Center(child: Text("Department")), fixedWidth: 220),
-      DataColumn2(label: Center(child: Text("Action")), fixedWidth: 170),
+      DataColumn2(label: Center(child: Text("Action")), fixedWidth: 250),
       DataColumn2(label: Center(child: Text("Akses")), fixedWidth: 190),
       DataColumn2(label: Center(child: Text("Method")), fixedWidth: 130),
       DataColumn2(label: Center(child: Text("Status")), fixedWidth: 130),

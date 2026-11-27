@@ -236,8 +236,7 @@ Future<Buletin?> showBuletinDetailDialog(
                                       buletin.rating = dialogRating.toInt();
                                       buletin.comment = dialogCommentCtrl.text
                                           .trim();
-
-                                      Navigator.of(parentContext).pop(buletin);
+                                      Navigator.of(context).pop(buletin);
                                     }
                                   : null,
                               child: const Text(
@@ -266,6 +265,5 @@ Future<Buletin?> showBuletinDetailDialog(
     },
   );
 
-  dialogCommentCtrl.dispose();
   return result;
 }

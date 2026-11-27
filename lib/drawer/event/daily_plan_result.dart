@@ -637,7 +637,7 @@ class _DailyPlanResultPageState extends State<DailyPlanResultPage>
       DataColumn2(label: Center(child: Text("Role")), fixedWidth: 180),
       DataColumn2(label: Center(child: Text("Site")), fixedWidth: 220),
       DataColumn2(label: Center(child: Text("Department")), fixedWidth: 260),
-      DataColumn2(label: Center(child: Text("Buletin")), fixedWidth: 380),
+      DataColumn2(label: Center(child: Text("Daily Plan")), fixedWidth: 380),
       DataColumn2(label: Center(child: Text("Creator Role")), fixedWidth: 180),
       DataColumn2(label: Center(child: Text("Rating")), fixedWidth: 200),
       DataColumn2(label: Center(child: Text("Komentar")), fixedWidth: 420),

@@ -234,12 +234,11 @@ Future<DailyPlan?> showDailyPlanDetailDialog(
                                         );
                                         return;
                                       }
-
                                       plan.rating = dialogRating.toInt();
                                       plan.comment = dialogCommentCtrl.text
                                           .trim();
 
-                                      Navigator.of(parentContext).pop(plan);
+                                      Navigator.of(context).pop(plan);
                                     }
                                   : null,
                               child: const Text(
@@ -272,6 +271,5 @@ Future<DailyPlan?> showDailyPlanDetailDialog(
     },
   );
 
-  dialogCommentCtrl.dispose();
   return result;
 }
